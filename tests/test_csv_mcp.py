@@ -23,3 +23,32 @@ def test_rejects_unsafe_paths(tmp_path, monkeypatch):
         assert "inside CSV_MCP_ROOT" in str(error)
     else:
         raise AssertionError("unsafe path was accepted")
+
+
+def test_write_and_edit_tools(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+
+    assert csv_mcp.create_csv(
+        "people.csv",
+        ["name", "age"],
+        [{"name": "Ada", "age": "36"}],
+    )["row_count"] == 1
+    csv_mcp.append_rows("people.csv", [{"name": "Linus", "age": "54"}])
+    assert csv_mcp.update_rows("people.csv", {"name": "Ada"}, {"age": "37"})["updated"] == 1
+    assert csv_mcp.delete_rows("people.csv", {"name": "Linus"})["deleted"] == 1
+    assert csv_mcp.read_csv("people.csv")["rows"] == [{"name": "Ada", "age": "37"}]
+
+
+def test_write_validation_preserves_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    path = tmp_path / "people.csv"
+    path.write_text("name,age\nAda,36\n", encoding="utf-8")
+
+    try:
+        csv_mcp.append_rows("people.csv", [{"name": "Linus"}])
+    except ValueError as error:
+        assert "exactly these columns" in str(error)
+    else:
+        raise AssertionError("invalid row was accepted")
+
+    assert path.read_text(encoding="utf-8") == "name,age\nAda,36\n"

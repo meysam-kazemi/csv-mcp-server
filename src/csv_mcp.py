@@ -1,5 +1,6 @@
 import csv
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,30 @@ def _reader(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return fields, list(reader)
 
 
+def _validate_rows(fields: list[str], rows: list[dict[str, str]]) -> None:
+    if not fields or any(not field for field in fields) or len(fields) != len(set(fields)):
+        raise ValueError("columns must be non-empty and unique")
+    for row in rows:
+        if set(row) != set(fields):
+            raise ValueError(f"each row must contain exactly these columns: {fields}")
+
+
+def _write(path: Path, fields: list[str], rows: list[dict[str, str]]) -> None:
+    _validate_rows(fields, rows)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
+            temporary_name = handle.name
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temporary_name, path)
+    finally:
+        if temporary_name:
+            Path(temporary_name).unlink(missing_ok=True)
+
+
 @mcp.tool()
 def list_csv_files() -> list[str]:
     """List CSV files below CSV_MCP_ROOT."""
@@ -60,6 +85,65 @@ def read_csv(path: str, offset: int = 0, limit: int = 100) -> dict[str, Any]:
         "returned": len(rows[offset : offset + limit]),
         "total": len(rows),
     }
+
+
+@mcp.tool()
+def create_csv(
+    path: str,
+    columns: list[str],
+    rows: list[dict[str, str]] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Create a CSV file. Existing files are protected unless overwrite is true."""
+    destination = _path(path, must_exist=False)
+    if destination.exists() and not overwrite:
+        raise FileExistsError(f"CSV file already exists: {path}")
+    rows = rows or []
+    _write(destination, columns, rows)
+    return {"path": path, "created": True, "row_count": len(rows)}
+
+
+@mcp.tool()
+def append_rows(path: str, rows: list[dict[str, str]]) -> dict[str, Any]:
+    """Append rows whose keys exactly match the CSV columns."""
+    destination = _path(path)
+    fields, existing = _reader(destination)
+    _write(destination, fields, existing + rows)
+    return {"path": path, "appended": len(rows), "row_count": len(existing) + len(rows)}
+
+
+@mcp.tool()
+def update_rows(path: str, match: dict[str, str], changes: dict[str, str]) -> dict[str, Any]:
+    """Update every row whose values exactly match all supplied match fields."""
+    if not match or not changes:
+        raise ValueError("match and changes must not be empty")
+    destination = _path(path)
+    fields, rows = _reader(destination)
+    unknown = (set(match) | set(changes)) - set(fields)
+    if unknown:
+        raise ValueError(f"unknown columns: {sorted(unknown)}")
+    updated = 0
+    for row in rows:
+        if all(row[key] == value for key, value in match.items()):
+            row.update(changes)
+            updated += 1
+    _write(destination, fields, rows)
+    return {"path": path, "updated": updated}
+
+
+@mcp.tool()
+def delete_rows(path: str, match: dict[str, str]) -> dict[str, Any]:
+    """Delete every row whose values exactly match all supplied match fields."""
+    if not match:
+        raise ValueError("match must not be empty")
+    destination = _path(path)
+    fields, rows = _reader(destination)
+    unknown = set(match) - set(fields)
+    if unknown:
+        raise ValueError(f"unknown columns: {sorted(unknown)}")
+    kept = [row for row in rows if not all(row[key] == value for key, value in match.items())]
+    _write(destination, fields, kept)
+    return {"path": path, "deleted": len(rows) - len(kept), "row_count": len(kept)}
 
 
 def main() -> None:
