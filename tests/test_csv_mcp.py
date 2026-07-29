@@ -86,17 +86,45 @@ def test_write_validation_preserves_file(tmp_path, monkeypatch):
 
 def test_parsing_options_and_detection(tmp_path, monkeypatch):
     monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
-    (tmp_path / "europe.csv").write_bytes("code;amount\r\n00123;12,50\r\n".encode("windows-1252"))
+    (tmp_path / "europe.csv").write_bytes(
+        "code;label;amount\r\n00123;café;12,50\r\n".encode("windows-1252")
+    )
     (tmp_path / "raw.tsv").write_text("Ada\t36\nLinus\t54\n", encoding="utf-8")
 
     inspection = csv_mcp.inspect_csv("europe.csv")
     assert inspection["delimiter"] == ";"
+    assert inspection["encoding"] == "windows-1252"
     assert inspection["possible_types"]["code"] == "string"
+    typed = csv_mcp.inspect_csv(
+        "europe.csv",
+        options=csv_mcp.CsvOptions(delimiter=";", decimal_separator=","),
+    )
+    assert typed["possible_types"]["amount"] == "decimal"
     assert csv_mcp.preview_csv(
         "raw.tsv",
         columns=["person"],
         options=csv_mcp.CsvOptions(header_mode="none", column_names=["person", "age"]),
     )["rows"] == [{"person": "Ada"}, {"person": "Linus"}]
+
+
+def test_quoting_bom_nulls_and_empty_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    (tmp_path / "complex.csv").write_bytes(
+        'name,note,empty\r\nAda,"hello,\n""world""",\r\n'.encode("utf-8-sig")
+    )
+    (tmp_path / "empty.csv").write_text("", encoding="utf-8")
+    (tmp_path / "header.csv").write_text("id,name\n", encoding="utf-8")
+
+    options = csv_mcp.CsvOptions(null_values=[""], keep_empty_strings=False)
+    inspection = csv_mcp.inspect_csv("complex.csv", options=options)
+    assert inspection["encoding"] == "utf-8-sig"
+    assert inspection["sample_rows"][0] == {
+        "name": "Ada",
+        "note": 'hello,\n"world"',
+        "empty": None,
+    }
+    assert csv_mcp.inspect_csv("empty.csv")["row_count"] == 0
+    assert csv_mcp.inspect_csv("header.csv")["columns"] == ["id", "name"]
 
 
 def test_reports_malformed_rows(tmp_path, monkeypatch):
@@ -228,3 +256,25 @@ def test_limits_and_simultaneous_writes(tmp_path, monkeypatch):
         except FileExistsError:
             outcomes.append("collision")
     assert len([result for result in outcomes if result == "collision"]) == 1
+
+
+def test_duplicate_headers_and_interrupted_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    (tmp_path / "duplicate.csv").write_text("id,id\n1,2\n", encoding="utf-8")
+    result = csv_mcp.validate_csv("duplicate.csv", {})
+    assert not result["valid"]
+    assert "unique column names" in result["issues"][0]["message"]
+
+    csv_mcp.create_csv("safe.csv", ["id"], [{"id": "original"}])
+
+    def interrupted(*args):
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(csv_mcp.os, "replace", interrupted)
+    try:
+        csv_mcp.create_csv("safe.csv", ["id"], [{"id": "replacement"}], overwrite=True)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("interrupted write unexpectedly succeeded")
+    assert (tmp_path / "safe.csv").read_text(encoding="utf-8") == "id\noriginal\n"

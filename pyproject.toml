@@ -1,7 +1,7 @@
 [project]
 name = "csv-mcp"
-version = "0.1.0"
-description = "A small MCP server for reading and editing CSV files"
+version = "0.2.0"
+description = "A safe MCP server for reading, analyzing, and editing CSV files"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.27,<2", "pandas>=2.2,<4", "pydantic>=2.12,<3"]
 

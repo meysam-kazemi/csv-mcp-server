@@ -1,5 +1,6 @@
 import csv
 import codecs
+import json
 import os
 import tempfile
 import threading
@@ -21,6 +22,7 @@ MAX_ROWS = int(os.environ.get("CSV_MCP_MAX_ROWS", 1_000_000))
 MAX_COLUMNS = int(os.environ.get("CSV_MCP_MAX_COLUMNS", 500))
 MAX_FIELD_LENGTH = int(os.environ.get("CSV_MCP_MAX_FIELD_LENGTH", 1024 * 1024))
 MAX_RETURNED_ROWS = int(os.environ.get("CSV_MCP_MAX_RETURNED_ROWS", 1000))
+MAX_FILES = int(os.environ.get("CSV_MCP_MAX_FILES", 10_000))
 ENCODINGS = {"utf-8", "utf-8-sig", "utf-16", "latin-1", "windows-1252"}
 DELIMITERS = {",", ";", "\t", "|"}
 csv.field_size_limit(MAX_FIELD_LENGTH)
@@ -242,7 +244,9 @@ def _reader(path: Path, options: CsvOptions | None = None) -> tuple[list[str], l
     return fields, rows
 
 
-def _possible_type(values: list[str | None]) -> str:
+def _possible_type(
+    values: list[str | None], decimal_separator: str = ".", date_format: str | None = None
+) -> str:
     present = [value for value in values if value not in {None, ""}]
     if not present:
         return "unknown"
@@ -254,13 +258,13 @@ def _possible_type(values: list[str | None]) -> str:
         return "integer"
     try:
         for value in present:
-            Decimal(value)
+            Decimal(value.replace(decimal_separator, "."))
         return "decimal"
     except InvalidOperation:
         pass
     try:
         for value in present:
-            date.fromisoformat(value)
+            datetime.strptime(value, date_format) if date_format else date.fromisoformat(value)
         return "date"
     except ValueError:
         return "string"
@@ -375,11 +379,17 @@ def _output_options(options: CsvOptions | None, metadata: dict[str, Any], fields
 @mcp.tool()
 def list_csv_files() -> list[str]:
     """List CSV and TSV files below CSV_MCP_ROOT."""
-    return sorted(
-        str(path.relative_to(ROOT))
-        for path in ROOT.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".csv", ".tsv"}
-    )
+    files = []
+    for path in ROOT.rglob("*"):
+        if path.is_file() and path.suffix.lower() in {".csv", ".tsv"}:
+            try:
+                _path(str(path.relative_to(ROOT)))
+            except ValueError:
+                continue
+            files.append(str(path.relative_to(ROOT)))
+            if len(files) >= MAX_FILES:
+                break
+    return sorted(files)
 
 
 @mcp.tool()
@@ -388,6 +398,7 @@ def inspect_csv(path: str, sample_rows: int = 100, options: CsvOptions | None = 
     if not 1 <= sample_rows <= MAX_RETURNED_ROWS:
         raise ValueError(f"sample_rows must be between 1 and {MAX_RETURNED_ROWS}")
     source = _path(path)
+    options = options or CsvOptions()
     fields, rows, metadata = _load(source, options, allow_malformed=True)
     sample = rows[:sample_rows]
     return {
@@ -397,7 +408,15 @@ def inspect_csv(path: str, sample_rows: int = 100, options: CsvOptions | None = 
         "columns": fields,
         "row_count": len(rows) + metadata["malformed_rows"],
         "sample_rows": sample,
-        "possible_types": {field: _possible_type([row[field] for row in sample]) for field in fields},
+        "possible_types": {
+            field: options.column_types.get(field)
+            or _possible_type(
+                [row[field] for row in sample],
+                options.decimal_separator,
+                options.date_formats.get(field),
+            )
+            for field in fields
+        },
     }
 
 
@@ -511,11 +530,14 @@ def query_csv(
     matched = [row for row in rows if _matches(row, filters, decimal_separator)]
     for order in reversed(sort):
         values = [row[order.column] for row in matched if row[order.column] not in {None, ""}]
-        numeric = _possible_type(values) in {"integer", "decimal"}
+        decimal_separator = options.decimal_separator if options else "."
+        numeric = _possible_type(values, decimal_separator) in {"integer", "decimal"}
         matched.sort(
             key=lambda row: (
                 row[order.column] is None,
-                Decimal(row[order.column]) if numeric and row[order.column] else row[order.column] or "",
+                Decimal(row[order.column].replace(decimal_separator, "."))
+                if numeric and row[order.column]
+                else row[order.column] or "",
             ),
             reverse=order.direction == "desc",
         )
@@ -946,6 +968,35 @@ def merge_csv(
         "columns": fields,
         "sha256": checksum,
     }
+
+
+@mcp.resource("csv://files")
+def files_resource() -> str:
+    """List available CSV files as JSON."""
+    return json.dumps({"files": list_csv_files()})
+
+
+@mcp.resource("csv://file/{name}/metadata")
+def metadata_resource(name: str) -> str:
+    """Expose CSV metadata as JSON."""
+    inspection = inspect_csv(name, sample_rows=10)
+    inspection.pop("sample_rows")
+    return json.dumps(inspection)
+
+
+@mcp.resource("csv://file/{name}/schema")
+def schema_resource(name: str) -> str:
+    """Expose CSV columns and conservative possible types as JSON."""
+    inspection = inspect_csv(name, sample_rows=100)
+    return json.dumps(
+        {"file": name, "columns": inspection["columns"], "possible_types": inspection["possible_types"]}
+    )
+
+
+@mcp.resource("csv://file/{name}/preview")
+def preview_resource(name: str) -> str:
+    """Expose a ten-row CSV preview as JSON."""
+    return json.dumps(preview_csv(name, limit=10))
 
 
 def main() -> None:
