@@ -80,3 +80,48 @@ def test_reports_malformed_rows(tmp_path, monkeypatch):
         assert "wrong number of fields" in str(error)
     else:
         raise AssertionError("malformed rows were accepted")
+
+
+def test_query_and_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    (tmp_path / "sales.csv").write_text(
+        "region,customer,amount\nwest,Acme,125.50\neast,Beta,75\nwest,Apex,200\n",
+        encoding="utf-8",
+    )
+
+    result = csv_mcp.query_csv(
+        "sales.csv",
+        select=["customer", "amount"],
+        filters=[csv_mcp.Filter(column="amount", operator=">", value=100)],
+        sort=[csv_mcp.Sort(column="amount", direction="desc")],
+    )
+    assert [row["customer"] for row in result["rows"]] == ["Apex", "Acme"]
+    summary = csv_mcp.summarize_csv(
+        "sales.csv",
+        group_by=["region"],
+        aggregations=[csv_mcp.Aggregation(column="amount", function="sum", output_name="total")],
+    )
+    assert summary["rows"] == [{"region": "west", "total": 325.5}, {"region": "east", "total": 75.0}]
+
+
+def test_validation_and_comparison(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    (tmp_path / "old.csv").write_text("id,date,name\n01,2026-01-01,Ada\n02,bad,Bob\n", encoding="utf-8")
+    (tmp_path / "new.csv").write_text(
+        "id,date,name\n01,2026-01-01,Ada Lovelace\n03,2026-02-01,Linus\n",
+        encoding="utf-8",
+    )
+
+    validation = csv_mcp.validate_csv(
+        "old.csv",
+        {
+            "id": csv_mcp.ColumnRule(required=True, unique=True),
+            "date": csv_mcp.ColumnRule(type="date", required=True),
+        },
+    )
+    assert not validation["valid"]
+    assert validation["issues"][0]["column"] == "date"
+    comparison = csv_mcp.compare_csv("old.csv", "new.csv", ["id"])
+    assert comparison["added_rows"] == 1
+    assert comparison["removed_rows"] == 1
+    assert comparison["changed_rows"] == 1
