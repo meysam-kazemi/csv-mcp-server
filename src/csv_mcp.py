@@ -2,8 +2,11 @@ import csv
 import codecs
 import os
 import tempfile
+import threading
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from functools import wraps
+from hashlib import sha256
 from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 
@@ -21,6 +24,7 @@ MAX_RETURNED_ROWS = int(os.environ.get("CSV_MCP_MAX_RETURNED_ROWS", 1000))
 ENCODINGS = {"utf-8", "utf-8-sig", "utf-16", "latin-1", "windows-1252"}
 DELIMITERS = {",", ";", "\t", "|"}
 csv.field_size_limit(MAX_FIELD_LENGTH)
+WRITE_LOCK = threading.RLock()
 mcp = FastMCP(
     "csv",
     instructions=f"Read and edit CSV files under {ROOT}. Paths are relative to this directory.",
@@ -39,6 +43,11 @@ class CsvOptions(BaseModel):
     column_names: list[str] | None = None
     null_values: list[str] = Field(default_factory=list)
     keep_empty_strings: bool = True
+    decimal_separator: Literal[".", ","] = "."
+    column_types: dict[str, Literal["string", "integer", "decimal", "boolean", "date"]] = Field(
+        default_factory=dict
+    )
+    date_formats: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("encoding")
     @classmethod
@@ -98,7 +107,23 @@ class ColumnRule(BaseModel):
     allowed_values: list[str] | None = None
 
 
+class CleanOperation(BaseModel):
+    operation: Literal["trim_whitespace", "lowercase", "uppercase", "drop_duplicates"]
+    columns: list[str]
+
+
+def _serialized(function):
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        with WRITE_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapper
+
+
 def _path(name: str, *, must_exist: bool = True) -> Path:
+    if "://" in name:
+        raise ValueError("URLs are not allowed")
     if Path(name).is_absolute() or PureWindowsPath(name).is_absolute():
         raise ValueError("absolute paths are not allowed")
     path = (ROOT / name).resolve()
@@ -241,7 +266,7 @@ def _possible_type(values: list[str | None]) -> str:
         return "string"
 
 
-def _validate_rows(fields: list[str], rows: list[dict[str, str]]) -> None:
+def _validate_rows(fields: list[str], rows: list[dict[str, str | None]]) -> None:
     if not fields or any(not field for field in fields) or len(fields) != len(set(fields)):
         raise ValueError("columns must be non-empty and unique")
     for row in rows:
@@ -249,20 +274,102 @@ def _validate_rows(fields: list[str], rows: list[dict[str, str]]) -> None:
             raise ValueError(f"each row must contain exactly these columns: {fields}")
 
 
-def _write(path: Path, fields: list[str], rows: list[dict[str, str]]) -> None:
+def _formula_value(
+    value: str | None,
+    policy: Literal["preserve", "escape", "reject"],
+    column_type: str,
+) -> str | None:
+    if not value or value[0] not in "=+-@":
+        return value
+    if value[0] == "-" and column_type in {"integer", "decimal"}:
+        try:
+            Decimal(value)
+            return value
+        except InvalidOperation:
+            pass
+    if policy == "reject":
+        raise ValueError("potential spreadsheet formula value was rejected")
+    return f"'{value}" if policy == "escape" else value
+
+
+def _write(
+    path: Path,
+    fields: list[str],
+    rows: list[dict[str, str | None]],
+    options: CsvOptions | None = None,
+    formula_policy: Literal["preserve", "escape", "reject"] = "escape",
+    column_types: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> str:
     _validate_rows(fields, rows)
+    if len(rows) > MAX_ROWS:
+        raise ValueError(f"output exceeds the {MAX_ROWS}-row limit")
+    options = options or CsvOptions()
+    encoding = options.encoding or "utf-8"
+    delimiter = options.delimiter or ("\t" if path.suffix.lower() == ".tsv" else ",")
+    write_options = options.model_copy(
+        update={"encoding": encoding, "delimiter": delimiter, "column_names": fields}
+    )
+    column_types = column_types or options.column_types
+    safe_rows = [
+        {
+            field: _formula_value(row[field], formula_policy, column_types.get(field, "string"))
+            for field in fields
+        }
+        for row in rows
+    ]
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_name = ""
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
-            temporary_name = handle.name
-            writer = csv.DictWriter(handle, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(rows)
-        os.replace(temporary_name, path)
-    finally:
-        if temporary_name:
-            Path(temporary_name).unlink(missing_ok=True)
+    # ponytail: process-local lock; use OS locks if multiple server processes write one workspace.
+    with WRITE_LOCK:
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"output file already exists: {path.relative_to(ROOT)}")
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding=encoding, newline="", dir=path.parent, delete=False
+            ) as handle:
+                temporary_name = handle.name
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=fields,
+                    delimiter=delimiter,
+                    quotechar=options.quotechar,
+                    escapechar=options.escapechar,
+                    doublequote=options.doublequote,
+                )
+                if options.header_mode == "first_row":
+                    writer.writeheader()
+                writer.writerows(safe_rows)
+            temporary = Path(temporary_name)
+            if temporary.stat().st_size > MAX_FILE_SIZE:
+                raise ValueError(f"output exceeds the {MAX_FILE_SIZE}-byte limit")
+            checked_fields, checked_rows, _ = _load(temporary, write_options)
+            if checked_fields != fields or len(checked_rows) != len(rows):
+                raise ValueError("temporary output validation failed")
+            digest = sha256(temporary.read_bytes()).hexdigest()
+            os.replace(temporary, path)
+            return digest
+        finally:
+            if temporary_name:
+                Path(temporary_name).unlink(missing_ok=True)
+
+
+def _output_path(source: str, output_file: str | None, operation: str) -> Path:
+    if output_file:
+        return _path(output_file, must_exist=False)
+    path = Path(source)
+    return _path(f"output/{path.stem}-{operation}{path.suffix.lower()}", must_exist=False)
+
+
+def _output_options(options: CsvOptions | None, metadata: dict[str, Any], fields: list[str]) -> CsvOptions:
+    options = options or CsvOptions()
+    return options.model_copy(
+        update={
+            "encoding": metadata["encoding"],
+            "delimiter": metadata["delimiter"],
+            "column_names": fields,
+        }
+    )
 
 
 @mcp.tool()
@@ -333,7 +440,9 @@ def read_csv(
     return preview_csv(path, offset, limit, columns, options)
 
 
-def _matches(row: dict[str, str | None], filters: list[Filter]) -> bool:
+def _matches(
+    row: dict[str, str | None], filters: list[Filter], decimal_separator: str = "."
+) -> bool:
     for condition in filters:
         value = row[condition.column]
         expected = condition.value
@@ -361,7 +470,7 @@ def _matches(row: dict[str, str | None], filters: list[Filter]) -> bool:
             right: str | Decimal = str(expected)
             if isinstance(expected, (int, float)):
                 try:
-                    left, right = Decimal(value), Decimal(str(expected))
+                    left, right = Decimal(value.replace(decimal_separator, ".")), Decimal(str(expected))
                 except InvalidOperation:
                     result = False
                     if not result:
@@ -398,7 +507,8 @@ def query_csv(
     fields, rows = _reader(_path(path), options)
     selected, filters, sort = select or fields, filters or [], sort or []
     _validate_columns(fields, set(selected) | {item.column for item in filters + sort})
-    matched = [row for row in rows if _matches(row, filters)]
+    decimal_separator = options.decimal_separator if options else "."
+    matched = [row for row in rows if _matches(row, filters, decimal_separator)]
     for order in reversed(sort):
         values = [row[order.column] for row in matched if row[order.column] not in {None, ""}]
         numeric = _possible_type(values) in {"integer", "decimal"}
@@ -438,7 +548,10 @@ def summarize_csv(
     numeric_functions = {"sum", "mean", "minimum", "maximum", "median"}
     for item in aggregations:
         if item.function in numeric_functions:
-            frame[item.column] = pd.to_numeric(frame[item.column], errors="raise")
+            values = frame[item.column]
+            if options and options.decimal_separator != ".":
+                values = values.str.replace(options.decimal_separator, ".", regex=False)
+            frame[item.column] = pd.to_numeric(values, errors="raise")
     groups = frame.groupby(group_by, dropna=False, sort=False) if group_by else [((), frame)]
     output = []
     for key, group in groups:
@@ -551,62 +664,288 @@ def compare_csv(
 
 
 @mcp.tool()
+@_serialized
 def create_csv(
-    path: str,
+    output_file: str,
     columns: list[str],
-    rows: list[dict[str, str]] | None = None,
+    rows: list[dict[str, str | None]] | None = None,
+    options: CsvOptions | None = None,
+    spreadsheet_formula_policy: Literal["preserve", "escape", "reject"] = "escape",
+    column_types: dict[str, str] | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Create a CSV file. Existing files are protected unless overwrite is true."""
-    destination = _path(path, must_exist=False)
-    if destination.exists() and not overwrite:
-        raise FileExistsError(f"CSV file already exists: {path}")
+    """Create a CSV/TSV file with atomic output and formula-injection handling."""
+    destination = _path(output_file, must_exist=False)
     rows = rows or []
-    _write(destination, columns, rows)
-    return {"path": path, "created": True, "row_count": len(rows)}
+    checksum = _write(
+        destination,
+        columns,
+        rows,
+        options,
+        spreadsheet_formula_policy,
+        column_types,
+        overwrite,
+    )
+    return {"output_file": output_file, "row_count": len(rows), "sha256": checksum}
 
 
 @mcp.tool()
-def append_rows(path: str, rows: list[dict[str, str]]) -> dict[str, Any]:
-    """Append rows whose keys exactly match the CSV columns."""
-    destination = _path(path)
-    fields, existing = _reader(destination)
-    _write(destination, fields, existing + rows)
-    return {"path": path, "appended": len(rows), "row_count": len(existing) + len(rows)}
+@_serialized
+def append_rows(
+    path: str,
+    rows: list[dict[str, str | None]],
+    output_file: str | None = None,
+    dry_run: bool = False,
+    options: CsvOptions | None = None,
+    spreadsheet_formula_policy: Literal["preserve", "escape", "reject"] = "escape",
+    column_types: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Append validated rows to a new output file by default."""
+    fields, existing, metadata = _load(_path(path), options)
+    _validate_rows(fields, rows)
+    destination = _output_path(path, output_file, "appended")
+    result = {
+        "appended_rows": len(rows),
+        "row_count": len(existing) + len(rows),
+        "output_file": str(destination.relative_to(ROOT)),
+        "file_written": not dry_run,
+    }
+    if not dry_run:
+        result["sha256"] = _write(
+            destination,
+            fields,
+            existing + rows,
+            _output_options(options, metadata, fields),
+            spreadsheet_formula_policy,
+            column_types,
+            overwrite,
+        )
+    return result
 
 
 @mcp.tool()
-def update_rows(path: str, match: dict[str, str], changes: dict[str, str]) -> dict[str, Any]:
-    """Update every row whose values exactly match all supplied match fields."""
-    if not match or not changes:
-        raise ValueError("match and changes must not be empty")
-    destination = _path(path)
-    fields, rows = _reader(destination)
-    unknown = (set(match) | set(changes)) - set(fields)
-    if unknown:
-        raise ValueError(f"unknown columns: {sorted(unknown)}")
-    updated = 0
-    for row in rows:
-        if all(row[key] == value for key, value in match.items()):
-            row.update(changes)
-            updated += 1
-    _write(destination, fields, rows)
-    return {"path": path, "updated": updated}
+@_serialized
+def update_rows(
+    path: str,
+    match: list[Filter],
+    set: dict[str, str | None],
+    output_file: str | None = None,
+    dry_run: bool = True,
+    options: CsvOptions | None = None,
+    spreadsheet_formula_policy: Literal["preserve", "escape", "reject"] = "escape",
+    column_types: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Update filtered rows, returning a bounded change preview before optional output."""
+    if not match or not set:
+        raise ValueError("match and set must not be empty")
+    fields, rows, metadata = _load(_path(path), options)
+    _validate_columns(fields, {item.column for item in match} | set.keys())
+    changes = []
+    matched = 0
+    changed_rows = 0
+    change_count = 0
+    for number, row in enumerate(rows, start=2):
+        if _matches(row, match, options.decimal_separator if options else "."):
+            matched += 1
+            row_changed = False
+            for column, value in set.items():
+                if row[column] != value:
+                    row_changed = True
+                    change_count += 1
+                    if len(changes) < MAX_RETURNED_ROWS:
+                        changes.append(
+                            {
+                                "row_number": number,
+                                "column": column,
+                                "old_value": row[column],
+                                "new_value": value,
+                            }
+                        )
+                    row[column] = value
+            changed_rows += row_changed
+    destination = _output_path(path, output_file, "updated")
+    result = {
+        "matched_rows": matched,
+        "changed_rows": changed_rows,
+        "changes": changes,
+        "changes_truncated": change_count > len(changes),
+        "output_file": str(destination.relative_to(ROOT)),
+        "file_written": not dry_run,
+    }
+    if not dry_run:
+        result["sha256"] = _write(
+            destination,
+            fields,
+            rows,
+            _output_options(options, metadata, fields),
+            spreadsheet_formula_policy,
+            column_types,
+            overwrite,
+        )
+    return result
 
 
 @mcp.tool()
-def delete_rows(path: str, match: dict[str, str]) -> dict[str, Any]:
-    """Delete every row whose values exactly match all supplied match fields."""
+@_serialized
+def delete_rows(
+    path: str,
+    match: list[Filter],
+    output_file: str | None = None,
+    dry_run: bool = True,
+    options: CsvOptions | None = None,
+    spreadsheet_formula_policy: Literal["preserve", "escape", "reject"] = "escape",
+    column_types: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Delete filtered rows, requiring a non-empty filter and defaulting to dry-run."""
     if not match:
         raise ValueError("match must not be empty")
-    destination = _path(path)
-    fields, rows = _reader(destination)
-    unknown = set(match) - set(fields)
-    if unknown:
-        raise ValueError(f"unknown columns: {sorted(unknown)}")
-    kept = [row for row in rows if not all(row[key] == value for key, value in match.items())]
-    _write(destination, fields, kept)
-    return {"path": path, "deleted": len(rows) - len(kept), "row_count": len(kept)}
+    fields, rows, metadata = _load(_path(path), options)
+    _validate_columns(fields, {item.column for item in match})
+    kept = [
+        row
+        for row in rows
+        if not _matches(row, match, options.decimal_separator if options else ".")
+    ]
+    destination = _output_path(path, output_file, "filtered")
+    result = {
+        "matched_rows": len(rows) - len(kept),
+        "row_count": len(kept),
+        "output_file": str(destination.relative_to(ROOT)),
+        "file_written": not dry_run,
+    }
+    if not dry_run:
+        result["sha256"] = _write(
+            destination,
+            fields,
+            kept,
+            _output_options(options, metadata, fields),
+            spreadsheet_formula_policy,
+            column_types,
+            overwrite=overwrite,
+        )
+    return result
+
+
+@mcp.tool()
+@_serialized
+def clean_csv(
+    path: str,
+    operations: list[CleanOperation],
+    output_file: str | None = None,
+    dry_run: bool = False,
+    options: CsvOptions | None = None,
+    spreadsheet_formula_policy: Literal["preserve", "escape", "reject"] = "escape",
+    column_types: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Trim, change case, and deduplicate selected columns."""
+    if not operations:
+        raise ValueError("operations must not be empty")
+    fields, rows, metadata = _load(_path(path), options)
+    _validate_columns(fields, {column for operation in operations for column in operation.columns})
+    before = len(rows)
+    for operation in operations:
+        if operation.operation == "drop_duplicates":
+            seen = set()
+            unique_rows = []
+            for row in rows:
+                key = tuple(row[column] for column in operation.columns)
+                if key not in seen:
+                    seen.add(key)
+                    unique_rows.append(row)
+            rows = unique_rows
+            continue
+        method = {
+            "trim_whitespace": "strip",
+            "lowercase": "lower",
+            "uppercase": "upper",
+        }[operation.operation]
+        for row in rows:
+            for column in operation.columns:
+                if row[column] is not None:
+                    row[column] = getattr(row[column], method)()
+    destination = _output_path(path, output_file, "clean")
+    result = {
+        "input_rows": before,
+        "output_rows": len(rows),
+        "removed_duplicates": before - len(rows),
+        "output_file": str(destination.relative_to(ROOT)),
+        "file_written": not dry_run,
+    }
+    if not dry_run:
+        result["sha256"] = _write(
+            destination,
+            fields,
+            rows,
+            _output_options(options, metadata, fields),
+            spreadsheet_formula_policy,
+            column_types,
+            overwrite=overwrite,
+        )
+    return result
+
+
+@mcp.tool()
+@_serialized
+def merge_csv(
+    files: list[str],
+    mode: Literal["concatenate", "join"],
+    output_file: str,
+    left_key: str | None = None,
+    right_key: str | None = None,
+    join_type: Literal["inner", "left", "right", "outer"] = "inner",
+    options: CsvOptions | None = None,
+    spreadsheet_formula_policy: Literal["preserve", "escape", "reject"] = "escape",
+    column_types: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Concatenate matching files or join exactly two files by keys."""
+    if len(files) < 2:
+        raise ValueError("at least two files are required")
+    loaded = [_load(_path(file), options) for file in files]
+    if mode == "concatenate":
+        fields = loaded[0][0]
+        if any(item[0] != fields for item in loaded[1:]):
+            raise ValueError("concatenated files must have identical columns and order")
+        rows = [row for _, file_rows, _ in loaded for row in file_rows]
+    else:
+        if len(files) != 2 or not left_key or not right_key:
+            raise ValueError("join requires exactly two files plus left_key and right_key")
+        left_fields, left_rows, _ = loaded[0]
+        right_fields, right_rows, _ = loaded[1]
+        _validate_columns(left_fields, {left_key})
+        _validate_columns(right_fields, {right_key})
+        frame = pd.DataFrame(left_rows, columns=left_fields).merge(
+            pd.DataFrame(right_rows, columns=right_fields),
+            how=join_type,
+            left_on=left_key,
+            right_on=right_key,
+            suffixes=("_left", "_right"),
+        )
+        fields = list(frame.columns)
+        rows = [
+            {field: None if pd.isna(value) else str(value) for field, value in row.items()}
+            for row in frame.to_dict(orient="records")
+        ]
+    destination = _path(output_file, must_exist=False)
+    checksum = _write(
+        destination,
+        fields,
+        rows,
+        options,
+        spreadsheet_formula_policy,
+        column_types,
+        overwrite,
+    )
+    return {
+        "output_file": output_file,
+        "row_count": len(rows),
+        "columns": fields,
+        "sha256": checksum,
+    }
 
 
 def main() -> None:

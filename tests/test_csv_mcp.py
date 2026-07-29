@@ -1,4 +1,5 @@
 import csv_mcp
+from concurrent.futures import ThreadPoolExecutor
 
 
 def test_read_tools(tmp_path, monkeypatch):
@@ -23,6 +24,17 @@ def test_rejects_unsafe_paths(tmp_path, monkeypatch):
     else:
         raise AssertionError("unsafe path was accepted")
 
+    outside = tmp_path.parent / "outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "escape").symlink_to(outside, target_is_directory=True)
+    for unsafe in ("escape/secret.csv", "https://example.com/data.csv", r"C:\Users\secret.csv"):
+        try:
+            csv_mcp.create_csv(unsafe, ["value"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsafe path was accepted: {unsafe}")
+
 
 def test_write_and_edit_tools(tmp_path, monkeypatch):
     monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
@@ -32,10 +44,29 @@ def test_write_and_edit_tools(tmp_path, monkeypatch):
         ["name", "age"],
         [{"name": "Ada", "age": "36"}],
     )["row_count"] == 1
-    csv_mcp.append_rows("people.csv", [{"name": "Linus", "age": "54"}])
-    assert csv_mcp.update_rows("people.csv", {"name": "Ada"}, {"age": "37"})["updated"] == 1
-    assert csv_mcp.delete_rows("people.csv", {"name": "Linus"})["deleted"] == 1
-    assert csv_mcp.read_csv("people.csv")["rows"] == [{"name": "Ada", "age": "37"}]
+    appended = csv_mcp.append_rows(
+        "people.csv",
+        [{"name": "Linus", "age": "54"}],
+        output_file="people-appended.csv",
+    )
+    assert len(appended["sha256"]) == 64
+    updated = csv_mcp.update_rows(
+        "people-appended.csv",
+        [csv_mcp.Filter(column="name", operator="=", value="Ada")],
+        {"age": "37"},
+        output_file="people-updated.csv",
+        dry_run=False,
+    )
+    assert updated["changed_rows"] == 1
+    deleted = csv_mcp.delete_rows(
+        "people-updated.csv",
+        [csv_mcp.Filter(column="name", operator="=", value="Linus")],
+        output_file="people-final.csv",
+        dry_run=False,
+    )
+    assert deleted["matched_rows"] == 1
+    assert csv_mcp.read_csv("people-final.csv")["rows"] == [{"name": "Ada", "age": "37"}]
+    assert csv_mcp.read_csv("people.csv")["rows"] == [{"name": "Ada", "age": "36"}]
 
 
 def test_write_validation_preserves_file(tmp_path, monkeypatch):
@@ -125,3 +156,75 @@ def test_validation_and_comparison(tmp_path, monkeypatch):
     assert comparison["added_rows"] == 1
     assert comparison["removed_rows"] == 1
     assert comparison["changed_rows"] == 1
+
+
+def test_dry_run_formula_policy_and_collision(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    csv_mcp.create_csv(
+        "values.csv",
+        ["label", "amount"],
+        [{"label": "=cmd()", "amount": "-12.5"}],
+        column_types={"amount": "decimal"},
+    )
+    assert csv_mcp.preview_csv("values.csv")["rows"] == [{"label": "'=cmd()", "amount": "-12.5"}]
+    result = csv_mcp.update_rows(
+        "values.csv",
+        [csv_mcp.Filter(column="amount", operator="<", value=0)],
+        {"label": "negative"},
+    )
+    assert result["changed_rows"] == 1
+    assert not result["file_written"]
+    assert not (tmp_path / "output" / "values-updated.csv").exists()
+
+    try:
+        csv_mcp.create_csv("values.csv", ["name"])
+    except FileExistsError:
+        pass
+    else:
+        raise AssertionError("existing output was overwritten")
+
+
+def test_clean_and_merge(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    (tmp_path / "one.csv").write_text("id,email\n1, ADA@EXAMPLE.COM \n1, ADA@EXAMPLE.COM \n", encoding="utf-8")
+    (tmp_path / "two.csv").write_text("id,email\n2,bob@example.com\n", encoding="utf-8")
+
+    cleaned = csv_mcp.clean_csv(
+        "one.csv",
+        [
+            csv_mcp.CleanOperation(operation="trim_whitespace", columns=["email"]),
+            csv_mcp.CleanOperation(operation="lowercase", columns=["email"]),
+            csv_mcp.CleanOperation(operation="drop_duplicates", columns=["id"]),
+        ],
+    )
+    assert cleaned["removed_duplicates"] == 1
+    merged = csv_mcp.merge_csv(
+        ["output/one-clean.csv", "two.csv"],
+        "concatenate",
+        "output/all.csv",
+    )
+    assert merged["row_count"] == 2
+    assert csv_mcp.preview_csv("output/all.csv")["rows"][0]["email"] == "ada@example.com"
+
+
+def test_limits_and_simultaneous_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr(csv_mcp, "ROOT", tmp_path.resolve())
+    monkeypatch.setattr(csv_mcp, "MAX_FILE_SIZE", 10)
+    (tmp_path / "large.csv").write_text("name\nlong-value\n", encoding="utf-8")
+    try:
+        csv_mcp.preview_csv("large.csv")
+    except ValueError as error:
+        assert "file exceeds" in str(error)
+    else:
+        raise AssertionError("oversized file was accepted")
+
+    monkeypatch.setattr(csv_mcp, "MAX_FILE_SIZE", 1024)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(csv_mcp.create_csv, "same.csv", ["id"], [{"id": str(index)}]) for index in range(2)]
+    outcomes = []
+    for future in futures:
+        try:
+            outcomes.append(future.result())
+        except FileExistsError:
+            outcomes.append("collision")
+    assert len([result for result in outcomes if result == "collision"]) == 1
