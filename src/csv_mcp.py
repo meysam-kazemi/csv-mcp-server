@@ -26,6 +26,7 @@ def _path(name: str, *, must_exist: bool = True) -> Path:
 
 
 def _reader(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    # ponytail: in-memory rows; switch to streaming or a database when files outgrow RAM.
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fields = reader.fieldnames or []
