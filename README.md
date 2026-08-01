@@ -23,6 +23,25 @@ MCP client configuration:
 }
 ```
 
+## LangChain agent
+
+Set an OpenAI API key and point the agent at the CSV workspace:
+
+```bash
+export OPENAI_API_KEY=your-key
+export CSV_MCP_ROOT=/absolute/path/to/csv-workspace
+uv run csv-agent
+```
+
+This starts an interactive chat; use `/quit` to exit. For a single request:
+
+```bash
+uv run csv-agent "List the CSV files and summarize the sales data"
+```
+
+The default model is `openai:gpt-4o-mini`. Override it with `CSV_AGENT_MODEL`, using a
+LangChain `provider:model` identifier whose provider integration is installed.
+
 A useful workspace layout is:
 
 ```text
