@@ -1,12 +1,13 @@
-# CSV MCP
+# CSV and Filesystem MCP
 
-A stdio MCP server for safely reading, analyzing, validating, and transforming CSV/TSV files. Values remain strings unless an operation explicitly needs a numeric or date type.
+Stdio MCP servers for safely working with CSV/TSV files and general UTF-8 text files.
 
 ## Run
 
 ```bash
 uv sync
 CSV_MCP_ROOT=/absolute/path/to/csv-workspace uv run csv-mcp
+FILESYSTEM_MCP_ROOT=/absolute/path/to/workspace uv run filesystem-mcp
 ```
 
 MCP client configuration:
@@ -18,6 +19,11 @@ MCP client configuration:
       "command": "uv",
       "args": ["--directory", "/absolute/path/to/csv-mcp", "run", "csv-mcp"],
       "env": {"CSV_MCP_ROOT": "/absolute/path/to/csv-workspace"}
+    },
+    "filesystem": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/csv-mcp", "run", "filesystem-mcp"],
+      "env": {"FILESYSTEM_MCP_ROOT": "/absolute/path/to/workspace"}
     }
   }
 }
@@ -30,6 +36,7 @@ Set an OpenAI API key and point the agent at the CSV workspace:
 ```bash
 export OPENAI_API_KEY=your-key
 export CSV_MCP_ROOT=/absolute/path/to/csv-workspace
+export FILESYSTEM_MCP_ROOT=/absolute/path/to/workspace
 uv run csv-agent
 ```
 
@@ -38,6 +45,9 @@ This starts an interactive chat; use `/quit` to exit. For a single request:
 ```bash
 uv run csv-agent "List the CSV files and summarize the sales data"
 ```
+
+The agent loads both MCP servers. If `FILESYSTEM_MCP_ROOT` is unset, it uses
+`CSV_MCP_ROOT` so both toolsets operate on the same workspace.
 
 The default model is `openai:gpt-4o-mini`. Override it with `CSV_AGENT_MODEL`, using a
 LangChain `provider:model` identifier whose provider integration is installed.
@@ -72,6 +82,10 @@ All paths are resolved below `CSV_MCP_ROOT`. Absolute paths, traversal, symlink 
 | `delete_rows` | Preview or write filtered deletions |
 | `clean_csv` | Trim, change case, and deduplicate |
 | `merge_csv` | Concatenate matching files or join two files |
+
+Filesystem tools are `list_directory`, `read_text_file`, `write_text_file`, and
+`replace_text`. Writes are atomic, refuse existing files by default, create parent
+directories, and cannot escape `FILESYSTEM_MCP_ROOT` through traversal or symlinks.
 
 Query operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `starts_with`, `ends_with`, `is_null`, `not_null`, and `in`. Aggregations are `count`, `sum`, `mean`, `minimum`, `maximum`, `median`, and `unique_count`.
 
